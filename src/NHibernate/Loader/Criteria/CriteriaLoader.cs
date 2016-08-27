@@ -30,6 +30,8 @@ namespace NHibernate.Loader.Criteria
 		private readonly string[] userAliases;
 		private readonly bool[] includeInResultRow;
 		private readonly int resultRowLength;
+		// caching NH-3486
+		private readonly string[] cachedProjectedColumnAliases;
 
 		public CriteriaLoader(IOuterJoinLoadable persister, ISessionFactoryImplementor factory, CriteriaImpl rootCriteria,
 							  string rootEntityName, IDictionary<string, IFilter> enabledFilters)
@@ -48,6 +50,11 @@ namespace NHibernate.Loader.Criteria
 			resultTypes = walker.ResultTypes;
 			includeInResultRow = walker.IncludeInResultRow;
 			resultRowLength = ArrayHelper.CountTrue(IncludeInResultRow);
+			// fill caching objects only if there is a projection
+			if (translator.HasProjection)
+			{
+				cachedProjectedColumnAliases = translator.ProjectedColumnAliases;
+			}
 
 			PostInstantiate();
 		}
@@ -74,7 +81,7 @@ namespace NHibernate.Loader.Criteria
 			get { return resultTypes; }
 		}
 
-		protected string[] ResultRowAliases
+		protected override string[] ResultRowAliases
 		{
 			get { return userAliases; }
 		}
@@ -113,22 +120,20 @@ namespace NHibernate.Loader.Criteria
 
 			if (translator.HasProjection)
 			{
-				IType[] types = translator.ProjectedTypes;
-				result = new object[types.Length];
-				string[] columnAliases = translator.ProjectedColumnAliases;
-				
+				result = new object[ResultTypes.Length];
+
 				for (int i = 0, position = 0; i < result.Length; i++)
 				{
-					int numColumns = types[i].GetColumnSpan(session.Factory);
-					
-					if ( numColumns > 1 ) 
+					int numColumns = ResultTypes[i].GetColumnSpan(session.Factory);
+
+					if (numColumns > 1)
 					{
-						string[] typeColumnAliases = ArrayHelper.Slice(columnAliases, position, numColumns);
-						result[i] = types[i].NullSafeGet(rs, typeColumnAliases, session, null);
+						string[] typeColumnAliases = ArrayHelper.Slice(cachedProjectedColumnAliases, position, numColumns);
+						result[i] = ResultTypes[i].NullSafeGet(rs, typeColumnAliases, session, null);
 					}
 					else
 					{
-						result[i] = types[i].NullSafeGet(rs, columnAliases[position], session, null);
+						result[i] = ResultTypes[i].NullSafeGet(rs, cachedProjectedColumnAliases[position], session, null);
 					}
 					position += numColumns;
 				}
@@ -168,22 +173,27 @@ namespace NHibernate.Loader.Criteria
 			Dictionary<string, LockMode> aliasedLockModes = new Dictionary<string, LockMode>();
 			Dictionary<string, string[]> keyColumnNames = dialect.ForUpdateOfColumns ? new Dictionary<string, string[]>() : null;
 			string[] drivingSqlAliases = Aliases;
-			for (int i = 0; i < drivingSqlAliases.Length; i++)
+
+			//NH-3710: if we are issuing an aggregation function, Aliases will be null
+			if (drivingSqlAliases != null)
 			{
-				LockMode lockMode;
-				if (lockModes.TryGetValue(drivingSqlAliases[i], out lockMode))
+				for (int i = 0; i < drivingSqlAliases.Length; i++)
 				{
-					ILockable drivingPersister = (ILockable) EntityPersisters[i];
-					string rootSqlAlias = drivingPersister.GetRootTableAlias(drivingSqlAliases[i]);
-					aliasedLockModes[rootSqlAlias] = lockMode;
-					if (keyColumnNames != null)
+					LockMode lockMode;
+					if (lockModes.TryGetValue(drivingSqlAliases[i], out lockMode))
 					{
-						keyColumnNames[rootSqlAlias] = drivingPersister.RootTableIdentifierColumnNames;
+						ILockable drivingPersister = (ILockable)EntityPersisters[i];
+						string rootSqlAlias = drivingPersister.GetRootTableAlias(drivingSqlAliases[i]);
+						aliasedLockModes[rootSqlAlias] = lockMode;
+						if (keyColumnNames != null)
+						{
+							keyColumnNames[rootSqlAlias] = drivingPersister.RootTableIdentifierColumnNames;
+						}
 					}
 				}
 			}
 
-			return dialect.ApplyLocksToSql(sqlSelectString, lockModes, keyColumnNames);
+			return dialect.ApplyLocksToSql(sqlSelectString, aliasedLockModes, keyColumnNames);
 		}
 
 		public override LockMode[] GetLockModes(IDictionary<string, LockMode> lockModes)
